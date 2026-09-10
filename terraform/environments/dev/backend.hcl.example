@@ -1,0 +1,2 @@
+bucket = "TON-PROJET-tfstate"
+prefix = "devsecops-platform/state"

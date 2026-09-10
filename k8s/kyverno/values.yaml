@@ -1,0 +1,58 @@
+# =============================================================================
+# Kyverno — admission control, dimensionné pour un cluster déjà à l'étroit
+# =============================================================================
+# 🎯 Le concept
+# Kyverno installe par défaut 4 contrôleurs séparés (admission,
+# background, cleanup, reports), chacun un Deployment à part — pensé pour
+# une prod qui veut isoler ces responsabilités. Sur CE cluster (déjà
+# chargé, voir les leçons CPU des Projets 2/3), en installer 4 par
+# réflexe gaspillerait des ressources pour des fonctionnalités qu'on
+# n'utilise pas toutes.
+#
+# ❓ Ce qu'on garde, ce qu'on coupe
+# - `admissionController` : OBLIGATOIRE, c'est lui qui bloque réellement
+#   à la création (le cœur de l'Étape 5).
+# - `backgroundController` : gardé, à 1 réplica — permet de voir aussi
+#   les ressources DÉJÀ existantes non conformes (PolicyReport), pas
+#   seulement les nouvelles.
+# - `cleanupController` : désactivé — aucune CleanupPolicy dans ce
+#   projet (nettoyage programmé de ressources), fonctionnalité inutilisée.
+# - `reportsController` : désactivé — agrégation de rapports au-delà de
+#   ce que backgroundController fournit déjà ; pas nécessaire pour
+#   valider que l'admission control fonctionne (Étape 8).
+admissionController:
+  replicas: 1
+  # Workload Identity — voir terraform/modules/registry-access : sans
+  # cette annotation, Kyverno n'a AUCUNE identité GCP pour appeler
+  # l'API du registre lui-même (vérifier une signature Cosign) —
+  # piège rencontré pour de vrai, voir le README §Admission Control.
+  # Déclaré ici plutôt que via `kubectl annotate` : un `kubectl
+  # annotate` manuel serait écrasé au prochain `helm upgrade`.
+  rbac:
+    serviceAccount:
+      annotations:
+        iam.gke.io/gcp-service-account: kyverno-registry-reader@devops-498817.iam.gserviceaccount.com
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+backgroundController:
+  enabled: true
+  replicas: 1
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
+cleanupController:
+  enabled: false
+
+reportsController:
+  enabled: false

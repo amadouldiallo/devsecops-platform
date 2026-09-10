@@ -1,0 +1,189 @@
+# =============================================================================
+# ClusterPolicy Kyverno — admission control pour task-tracker
+# =============================================================================
+#
+# 🎯 Le concept
+# Kyverno inspecte chaque ressource Kubernetes À SA CRÉATION et la rejette
+# si elle viole une règle — avant même qu'un pod ne démarre. `background:
+# true` fait aussi tourner la même règle sur les ressources DÉJÀ
+# existantes (via backgroundController), pour un rapport de conformité,
+# sans pouvoir les bloquer rétroactivement (elles tournent déjà).
+#
+# ❓ Pourquoi SCOPÉ au namespace task-tracker, pas cluster-wide
+# Le guide dit "installe Kyverno et crée 4 ClusterPolicy" sans préciser
+# le périmètre — appliquer ces 4 règles À TOUT LE CLUSTER casserait
+# immédiatement Prometheus, Grafana, Loki, Tempo, Argo CD, cert-manager,
+# Vault, ingress-nginx, OpenCost... aucun d'entre eux ne vient du
+# registre "approuvé" (le nôtre) ni n'est signé par NOTRE pipeline CI.
+# Un admission control mal scopé peut littéralement rendre un cluster
+# inutilisable — ces 4 politiques ne s'appliquent donc qu'à notre propre
+# application (task-tracker), le périmètre qu'on maîtrise réellement.
+#
+# ⚠️ `validationFailureAction: Enforce` — mais pas dès le départ. Déployées
+# d'abord en `Audit` le temps de vérifier contre les ressources RÉELLEMENT
+# en place (frontend/backend/db) sans risquer de casser quoi que ce soit ;
+# basculé en `Enforce` seulement une fois confirmé que l'app passe (ou que
+# les exceptions documentées sont légitimes) — voir le README pour le
+# détail de cette vérification, et les deux vrais bugs qu'elle a révélés
+# (accès registre manquant pour Kyverno, `:latest` jamais signée).
+#
+# 🔭 Note sur la dépréciation : Kyverno 1.19 annonce `ClusterPolicy`
+# comme dépréciée au profit de `ValidatingPolicy`/`ImageValidatingPolicy`
+# (CEL, voir https://kyverno.io/docs/guides/migration-to-cel/) — encore
+# fonctionnelle aujourd'hui et ce que le guide demande explicitement,
+# gardée ici en connaissance de cause plutôt que migrée vers une API plus
+# récente et moins éprouvée pour ce projet précis.
+
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-privileged-containers
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: privileged-containers
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              namespaces: ["task-tracker"]
+      validate:
+        message: "Les conteneurs privileged sont interdits dans task-tracker."
+        pattern:
+          spec:
+            containers:
+              - name: "*"
+                =(securityContext):
+                  =(privileged): "false"
+
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-run-as-non-root
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    # ⚠️ Exception documentée, pas un oubli : le pod "db" (Postgres)
+    # démarre volontairement en root pour ajuster les permissions du
+    # volume de données, avant de basculer lui-même vers l'utilisateur
+    # postgres via gosu — voir charts/app/templates/db-statefulset.yaml
+    # (dépôt gitops-platform) pour l'explication complète, déjà écrite
+    # AVANT même que ce projet n'existe. Le durcir proprement demanderait
+    # un initContainer dédié, explicitement hors scope ici.
+    - name: run-as-non-root
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              namespaces: ["task-tracker"]
+              selector:
+                matchExpressions:
+                  - key: app.kubernetes.io/name
+                    operator: NotIn
+                    values: ["db"]
+      validate:
+        message: "runAsNonRoot doit être explicitement true (pod ou conteneur)."
+        anyPattern:
+          - spec:
+              securityContext:
+                runAsNonRoot: true
+          - spec:
+              containers:
+                - securityContext:
+                    runAsNonRoot: true
+
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: restrict-image-registries
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: approved-registry-only
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              namespaces: ["task-tracker"]
+      validate:
+        message: "Seules les images du registre approuvé (europe-west1-docker.pkg.dev/devops-498817/gitops-images) sont autorisées."
+        pattern:
+          spec:
+            containers:
+              - name: "*"
+                image: "europe-west1-docker.pkg.dev/devops-498817/gitops-images/*"
+
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-backend-image-signature
+  # ⚠️ Piège rencontré pour de vrai en passant en Enforce : par défaut,
+  # Kyverno "autogen" cette règle aussi contre le Deployment lui-même (pas
+  # seulement le Pod qu'il crée) — mais SEULE la création d'un Pod réel
+  # est mutée avec le digest résolu (mutateDigest), jamais le
+  # PodTemplateSpec d'un Deployment. Résultat : la copie "autogen" au
+  # niveau Deployment échouait TOUJOURS avec "missing digest", quel que
+  # soit le résultat réel de la vérification — `kubectl rollout restart`
+  # bloqué en boucle alors que le Pod effectivement créé, lui, passait la
+  # vérification sans problème. Fixé en désactivant l'autogen pour CETTE
+  # politique précise : elle ne s'applique plus qu'à la création réelle du
+  # Pod, où mutateDigest fonctionne correctement — les 3 autres politiques
+  # (pattern simple, pas de résolution de digest externe) n'ont jamais eu
+  # ce problème, autogen reste actif pour elles.
+  annotations:
+    pod-policies.kyverno.io/autogen-controllers: "none"
+spec:
+  # ⚠️ Scopée à task-tracker-backend PRÉCISÉMENT (imageReferences), pas à
+  # "toute image de task-tracker" : à ce stade du projet, seul le backend
+  # est signé par le pipeline CI (Étape 4, dépôt gitops-platform) — le
+  # frontend et la db ne le sont pas encore. Élargir cette règle avant
+  # d'avoir élargi la signature elle-même bloquerait leur déploiement
+  # pour une raison qui n'aurait rien à voir avec une vraie régression.
+  validationFailureAction: Enforce
+  webhookConfiguration:
+    timeoutSeconds: 30
+  rules:
+    - name: verify-cosign-keyless
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              namespaces: ["task-tracker"]
+      verifyImages:
+        - imageReferences:
+            - "europe-west1-docker.pkg.dev/devops-498817/gitops-images/task-tracker-backend:*"
+          # ⚠️ Piège rencontré DEUX fois, dans deux sens opposés :
+          # 1) En mode Audit, mutateDigest DOIT être false ("mutateDigest
+          #    must be set to false for 'Audit' failure action").
+          # 2) En passant en Enforce avec mutateDigest: false, le
+          #    déploiement du backend s'est mis à être REJETÉ en bloc —
+          #    "missing digest for ...task-tracker-backend:latest" — alors
+          #    que la même image avait été vérifiée avec succès quelques
+          #    minutes plus tôt en Audit. Root cause : en Enforce, Kyverno
+          #    a besoin d'ÉCRIRE le digest résolu dans la ressource pour
+          #    considérer la vérification complète ; sans mutation
+          #    autorisée, il n'a rien à écrire et refuse plutôt que de
+          #    passer silencieusement (contrairement à Audit, qui se
+          #    contente d'avertir). `true` est donc le seul réglage qui
+          #    fonctionne EN Enforce — et un vrai bénéfice au passage :
+          #    l'image tournant réellement est désormais épinglée par
+          #    digest exact, pas par un tag `:latest` qui pourrait changer
+          #    de cible après coup.
+          mutateDigest: true
+          # Même identité que celle déjà vérifiée manuellement avec
+          # `cosign verify` (Étape 4) — reprise ici à l'identique, pas
+          # une nouvelle configuration non testée.
+          attestors:
+            - entries:
+                - keyless:
+                    subject: "https://github.com/amadouldiallo/gitops-platform/.github/workflows/security-ci.yml@refs/heads/main"
+                    issuer: "https://token.actions.githubusercontent.com"
+                    rekor:
+                      url: https://rekor.sigstore.dev
