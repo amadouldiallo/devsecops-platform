@@ -1,0 +1,4 @@
+# macOS / éditeurs
+.DS_Store
+.vscode/
+*.swp
