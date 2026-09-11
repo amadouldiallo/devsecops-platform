@@ -65,7 +65,7 @@ Mêmes symboles que les Projets 1-3 en tête de bloc de commentaire :
 | 4 — Image Signing (Cosign) | ✅ **signature vérifiée + contrôle négatif** (dépôt gitops-platform) |
 | 5 — Admission Control (Kyverno) | ✅ **déployé, `Enforce`, testé sur le vrai cluster** — voir §Admission Control |
 | 6 — Runtime Security (Falco) | ✅ **déployé, testé sur le vrai cluster** — voir §Runtime Security |
-| 7 — Network Security | ⬜ à faire |
+| 7 — Network Security | ✅ **deny-all + testé sur le vrai cluster** — voir §Network Security |
 | 8 — Security Testing | ⬜ à faire |
 
 ## Étapes 1-4 — CI de sécurité (dépôt gitops-platform)
@@ -218,8 +218,63 @@ helm install falco falcosecurity/falco -n falco --create-namespace \
   -f k8s/falco/values.yaml --version 9.1.0 --wait
 ```
 
+## Network Security
+
+`k8s/network-security/policies.yaml` — deny-all ingress ET egress par
+défaut sur le namespace `task-tracker`, puis autorisation explicite de
+chaque flux réellement nécessaire.
+
+```mermaid
+flowchart LR
+    NGINX["ingress-nginx"] -->|:8080| FE["frontend"]
+    NGINX -->|:8000| BE["backend"]
+    FE -->|:8000| BE
+    BE -->|:5432| DB["db"]
+    BE -->|:4317| TEMPO["tracing (Tempo)"]
+    MON["monitoring"] -->|:8000 scrape| BE
+    ALL["tous les pods"] -->|:53| DNS["kube-system (CoreDNS)"]
+
+    style NGINX fill:#4A5568,color:#fff
+    style DB fill:#C53030,color:#fff
+```
+
+❓ **Pourquoi ce fichier ne modifie AUCUNE ressource des Projets 2/3** :
+les `NetworkPolicy` Kubernetes sont additives — une nouvelle policy en
+`policyTypes: ["Egress"]` s'AJOUTE aux policies existantes (en
+`["Ingress"]` seulement) sans les remplacer. Contrairement aux Étapes
+précédentes de ce projet (qui avaient dû éditer gitops-platform ou
+observability-platform), le durcissement réseau tient entièrement dans
+ce dépôt.
+
+⚠️ **Le piège classique, anticipé cette fois** : un deny-all egress sans
+règle DNS explicite casse tout — même résoudre un Service par son nom
+dépend d'un accès réseau réel à CoreDNS. `allow-dns-egress` est
+appliquée AVANT les deny-all dans ce fichier (l'ordre d'un YAML
+multi-documents avec `kubectl apply -f` est respecté), pour réduire au
+minimum la fenêtre où le namespace serait bloqué sans la moindre
+autorisation.
+
+**Vérifié réellement, pas juste "les policies existent" :**
+- App publique (frontend + `/api` direct) : `200` après application des
+  8 policies, écriture réelle en base confirmée (`POST /api/tasks` →
+  `201`).
+- Prometheus continue de scraper le backend (`up{job="task-tracker-backend"}
+  == 1`), les traces continuent d'arriver dans Tempo — aucune régression
+  sur les Projets 2/3.
+- `db` reste sain sans AUCUNE règle egress dédiée au-delà du DNS partagé
+  — confirmé qu'une base de données n'a réellement besoin d'aucune
+  connexion sortante.
+- **Contrôle négatif** : une connexion TCP directe depuis le pod backend
+  vers `grafana.grafana.svc.cluster.local` (un service qui n'a jamais été
+  autorisé) `timeout` — le deny-all bloque réellement ce qu'il est censé
+  bloquer, pas seulement ce qu'on a pensé à tester.
+
+```bash
+kubectl apply -f k8s/network-security/policies.yaml
+```
+
 ---
 
-*Les sections Étapes 7-8 seront ajoutées au fil de l'avancement réel,
-testées sur le cluster avant d'être documentées — même discipline que les
-Projets 1 à 3.*
+*La section Étape 8 sera ajoutée au fil de l'avancement réel, testée sur
+le cluster avant d'être documentée — même discipline que les Projets 1 à
+3.*

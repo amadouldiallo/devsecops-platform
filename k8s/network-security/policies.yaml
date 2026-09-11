@@ -1,0 +1,174 @@
+# =============================================================================
+# NetworkPolicy durcies — deny-all par défaut, namespace task-tracker
+# =============================================================================
+#
+# 🎯 Le concept
+# Le Projet 2 avait déjà des NetworkPolicy (`db-allow-from-backend`,
+# `backend-allow-from-frontend`, dépôt gitops-platform,
+# k8s/namespace/05-networkpolicy.yaml) — mais UNIQUEMENT en ingress, et
+# frontend n'avait AUCUNE policy (donc grand ouvert par défaut, en
+# ingress ET en égress). Ce fichier ajoute ce qui manquait : un deny-all
+# ingress ET egress par défaut sur tout le namespace, puis autorise
+# explicitement chaque flux réellement nécessaire.
+#
+# ❓ Pourquoi ce fichier ne MODIFIE aucune ressource du Projet 2
+# Les NetworkPolicy Kubernetes sont ADDITIVES par conception : dès qu'UNE
+# policy sélectionne un pod pour une direction (ingress/egress), ce pod
+# passe en liste blanche pour CETTE direction, et TOUTES les policies qui
+# le sélectionnent pour cette même direction voient leurs règles réunies
+# (OR, pas remplacement). Les policies existantes de gitops-platform ne
+# déclarent QUE `policyTypes: ["Ingress"]` — ajouter ici des policies
+# séparées en `policyTypes: ["Egress"]` (et un deny-all ingress qui vient
+# compléter, pas remplacer, l'existant) suffit à durcir le namespace SANS
+# toucher au dépôt gitops-platform, contrairement aux Étapes précédentes
+# de ce projet qui, elles, avaient dû éditer des fichiers du Projet 2/3.
+#
+# ⚠️ Ordre d'application volontaire : les règles d'AUTORISATION sont
+# déclarées AVANT les deny-all dans ce fichier, et `kubectl apply -f`
+# traite un YAML multi-documents dans l'ordre où il est écrit — le temps
+# où le namespace pourrait être bloqué sans qu'aucune autorisation
+# n'existe encore est ainsi réduit au minimum, plutôt que déployer
+# deny-all en premier et espérer que les autorisations arrivent assez
+# vite derrière.
+
+---
+# Sans cette règle, RIEN ne fonctionne plus une fois le deny-all egress
+# en place — vérifié pour de vrai (voir README) : même se connecter à un
+# Service par son NOM DNS échoue si CoreDNS lui-même est bloqué.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: task-tracker
+spec:
+  podSelector: {}
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+# frontend n'avait AUCUNE policy au Projet 2 (donc ouvert par défaut) —
+# le deny-all ingress plus bas le ferme aussi ; cette règle rouvre
+# exactement ce qui est légitime : le trafic entrant depuis ingress-nginx.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: frontend-allow-ingress-from-ingress-nginx
+  namespace: task-tracker
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: frontend
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8080
+
+---
+# frontend → backend (proxy nginx sur /api, voir apps/frontend/nginx.conf.template
+# dans gitops-platform) — jusqu'ici ouvert par défaut, maintenant explicite.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: frontend-allow-egress-to-backend
+  namespace: task-tracker
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: frontend
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: backend
+      ports:
+        - protocol: TCP
+          port: 8000
+
+---
+# backend → db — le pendant EGRESS de db-allow-from-backend (ingress,
+# déjà dans gitops-platform) : sans lui, le deny-all egress empêcherait
+# le backend d'INITIER la connexion, même si db accepte de la recevoir.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backend-allow-egress-to-db
+  namespace: task-tracker
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: backend
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: db
+      ports:
+        - protocol: TCP
+          port: 5432
+
+---
+# backend → Tempo (traces OTLP, Projet 3 Étape 3) — Tempo autorise déjà
+# l'ingress depuis task-tracker (tempo-allow-ingress, dépôt
+# observability-platform) ; il manquait le pendant EGRESS côté backend.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backend-allow-egress-to-tracing
+  namespace: task-tracker
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: backend
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: tracing
+      ports:
+        - protocol: TCP
+          port: 4317
+
+# 🔭 db (Postgres) ne reçoit ICI aucune règle egress au-delà de la DNS
+# partagée — testé volontairement sans, voir README : une base de
+# données n'a normalement aucune raison d'initier une connexion sortante.
+
+---
+# Deny-all ingress : vient compléter (pas remplacer) les policies déjà
+# en place pour db/backend — frontend, sans policy jusqu'ici, passe ici
+# pour la première fois en liste blanche (voir l'autorisation ci-dessus,
+# déjà en place avant celle-ci grâce à l'ordre du fichier).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: task-tracker
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress"]
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: task-tracker
+spec:
+  podSelector: {}
+  policyTypes: ["Egress"]
