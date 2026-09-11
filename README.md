@@ -66,7 +66,7 @@ Mêmes symboles que les Projets 1-3 en tête de bloc de commentaire :
 | 5 — Admission Control (Kyverno) | ✅ **déployé, `Enforce`, testé sur le vrai cluster** — voir §Admission Control |
 | 6 — Runtime Security (Falco) | ✅ **déployé, testé sur le vrai cluster** — voir §Runtime Security |
 | 7 — Network Security | ✅ **deny-all + testé sur le vrai cluster** — voir §Network Security |
-| 8 — Security Testing | ⬜ à faire |
+| 8 — Security Testing | ✅ **5 tests réels, 1 trou trouvé et corrigé** — voir §Security Testing |
 
 ## Étapes 1-4 — CI de sécurité (dépôt gitops-platform)
 
@@ -127,6 +127,7 @@ flowchart TD
 | `require-run-as-non-root` | tout `task-tracker` SAUF `db` | ✅ passe (db exclu, exception documentée) |
 | `restrict-image-registries` | tout `task-tracker` | ✅ passe (toutes les images viennent déjà du registre approuvé) |
 | `verify-backend-image-signature` | uniquement `task-tracker-backend` | ✅ passe, après correction de 2 bugs réels (voir plus bas) |
+| `disallow-host-path` | tout `task-tracker` | ➕ **ajoutée à l'Étape 8** — trou de couverture trouvé en testant, voir [docs/security-tests.md](docs/security-tests.md) |
 
 **Déployées d'abord en `Audit`**, vérifiées contre l'app RÉELLEMENT en
 place, puis basculées en `Enforce` seulement une fois confirmé qu'aucune
@@ -275,6 +276,70 @@ kubectl apply -f k8s/network-security/policies.yaml
 
 ---
 
-*La section Étape 8 sera ajoutée au fil de l'avancement réel, testée sur
-le cluster avant d'être documentée — même discipline que les Projets 1 à
-3.*
+## Security Testing (chaos volontaire)
+
+[docs/security-tests.md](docs/security-tests.md) — 5 manifestes
+délibérément non conformes (`k8s/security-tests/`), chacun isolant une
+seule violation, déployés pour de vrai contre les politiques Kyverno en
+`Enforce`.
+
+| Test | Résultat |
+|---|---|
+| Conteneur `privileged: true` | ✅ Bloqué (par 2 politiques indépendantes) |
+| Volume `hostPath` (`/` du node) | ⚠️ **Admis au premier essai** — accès réel confirmé (`cat /host/etc/passwd`), politique manquante ajoutée en direct, re-testé bloqué |
+| Conteneur sans `runAsNonRoot` | ✅ Bloqué |
+| Image jamais signée (même registre, tag non passé par la CI) | ✅ Bloqué |
+| Image d'un registre public (Docker Hub) | ✅ Bloqué |
+
+❓ **Le résultat le plus important n'est pas "4 sur 5 bloqués"** — c'est
+que le 5ᵉ, sur son PREMIER essai, ne l'était pas. Un `hostPath` monté sur
+`/` du node a été accepté par Kyverno (aucune des 4 politiques de
+l'Étape 5 ne couvre ce vecteur), et un `kubectl exec` a confirmé un vrai
+accès en lecture au `/etc/passwd` du node — pas une faille théorique.
+Corrigé en ajoutant une 5ᵉ `ClusterPolicy`
+(`disallow-host-path`), puis re-testé avec le MÊME manifeste : bloqué.
+Le nombre réel de politiques actives sur ce cluster est passé de 4 à 5
+en conséquence directe de ce test — exactement ce que le guide anticipe
+("une politique qui ne bloque pas ce qu'elle est censée bloquer est un
+faux sentiment de sécurité pire que l'absence de politique").
+
+Tous les pods de test et l'image non signée ont été supprimés après
+vérification.
+
+```bash
+kubectl apply -f k8s/security-tests/01-privileged.yaml       # bloqué
+kubectl apply -f k8s/security-tests/02-hostpath.yaml          # bloqué (après correction)
+kubectl apply -f k8s/security-tests/03-root-container.yaml    # bloqué
+kubectl apply -f k8s/security-tests/04-unsigned-image.yaml    # bloqué
+kubectl apply -f k8s/security-tests/05-unapproved-registry.yaml  # bloqué
+```
+
+---
+
+## Guide terminé — et maintenant ?
+
+Les 8 étapes du Projet 4 sont construites et testées sur le vrai
+`gitops-platform` (Projet 2) et son pipeline CI, pas seulement décrites.
+Récapitulatif des découvertes réelles qui ne figuraient dans aucun plan
+initial :
+
+- Un pipeline CI qui n'existait pas encore pour ce dépôt (tous les
+  builds précédents avaient été faits à la main) — mis en place avec
+  Workload Identity dédié, sans clé statique.
+- 3 vraies CVE HIGH trouvées par Trivy dans une dépendance figée depuis
+  le Projet 3, corrigées, avec un bonus inattendu (déblocage d'une
+  contrainte de version posée pour une tout autre raison).
+- Kyverno sans accès au registre pour vérifier une signature — un pod
+  ordinaire n'hérite pas de l'identité GCP du node.
+- Une CI qui signait un tag différent de celui réellement déployé — la
+  signature vérifiait le mauvais objet, sans que rien ne le signale
+  avant un test réel.
+- Un bug retors de Falco (`rule_matching: first`) qui a fait chercher la
+  cause au mauvais endroit avant de la trouver au bon.
+- Un `hostPath` accepté par erreur, avec un accès réel démontré avant
+  d'être corrigé.
+
+Comme le suggère le guide original : le **Projet 5 bonus (Platform
+Engineering / Backstage)** reste une option à part, pas une suite
+obligatoire — les 4 projets du socle (Cloud/IaC, Kubernetes/GitOps,
+Observability/SRE, DevSecOps) sont maintenant complets.

@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sectest-unsigned
+  namespace: task-tracker
+  labels:
+    app.kubernetes.io/name: sectest
+spec:
+  containers:
+    - name: test
+      # Même dépôt approuvé, même nom d'image que le backend réel — le
+      # SEUL écart est que ce tag précis n'est jamais passé par la CI
+      # sécurisée (poussé à la main, jamais signé). Isole la vérification
+      # de signature des 3 autres politiques (registre approuvé : oui —
+      # non-root/non-privileged : oui aussi, réglés correctement
+      # ci-dessous pour ne tester QUE la signature).
+      image: europe-west1-docker.pkg.dev/devops-498817/gitops-images/task-tracker-backend:unsigned-test
+      command: ["sleep", "3600"]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001

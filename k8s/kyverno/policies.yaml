@@ -187,3 +187,33 @@ spec:
                     issuer: "https://token.actions.githubusercontent.com"
                     rekor:
                       url: https://rekor.sigstore.dev
+
+---
+# ⚠️ 5ᵉ politique, ajoutée APRÈS l'Étape 8 (tests de sécurité), pas avant
+# — le guide en demandait 4 à l'Étape 5, mais son propre scénario de test
+# à l'Étape 8 inclut un pod hostPath. Testé sans cette politique : le pod
+# `sectest-hostpath` a été ADMIS (aucune des 4 politiques existantes ne
+# couvre ce vecteur), et a eu un accès en LECTURE réel confirmé au
+# filesystem du node (`/etc/passwd` du node, lu depuis le pod). Un vrai
+# trou de couverture trouvé en testant, pas deviné — voir
+# docs/security-tests.md pour le détail complet, avant/après.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-host-path
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: host-path
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              namespaces: ["task-tracker"]
+      validate:
+        message: "Les volumes hostPath sont interdits dans task-tracker."
+        pattern:
+          spec:
+            =(volumes):
+              - X(hostPath): "null"

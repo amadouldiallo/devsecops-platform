@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sectest-privileged
+  namespace: task-tracker
+  labels:
+    app.kubernetes.io/name: sectest
+spec:
+  containers:
+    - name: test
+      image: europe-west1-docker.pkg.dev/devops-498817/gitops-images/task-tracker-backend:latest
+      command: ["sleep", "3600"]
+      securityContext:
+        privileged: true

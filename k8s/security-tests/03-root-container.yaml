@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sectest-root
+  namespace: task-tracker
+  labels:
+    app.kubernetes.io/name: sectest
+spec:
+  containers:
+    - name: test
+      image: europe-west1-docker.pkg.dev/devops-498817/gitops-images/task-tracker-backend:latest
+      command: ["sleep", "3600"]
+      # Ni runAsNonRoot ni runAsUser : le conteneur démarrerait avec
+      # l'utilisateur par défaut de l'image (root, uid 0, sauf USER
+      # explicite — ici l'image bascule déjà vers appuser en interne,
+      # mais Kyverno vérifie la DÉCLARATION du pod, pas ce que l'image
+      # fait en interne).

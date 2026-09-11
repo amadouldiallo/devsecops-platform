@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sectest-unapproved-registry
+  namespace: task-tracker
+  labels:
+    app.kubernetes.io/name: sectest
+spec:
+  containers:
+    - name: test
+      # Docker Hub public — jamais notre registre. Réglé non-root/non-
+      # privileged pour isoler la vérification de registre des 2 autres
+      # politiques applicables (le nom d'image ne matchant pas
+      # "task-tracker-backend", la politique de signature, elle, ne
+      # s'applique même pas à ce pod — hors de son imageReferences).
+      image: docker.io/library/nginx:1.27-alpine
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
