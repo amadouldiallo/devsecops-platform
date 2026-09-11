@@ -1,0 +1,118 @@
+# =============================================================================
+# Falco — détection runtime, dimensionnée pour un cluster déjà à l'étroit
+# =============================================================================
+# 🎯 Le concept
+# Falco tourne obligatoirement en DaemonSet (un pod par node) — il observe
+# les appels système directement sur chaque node, une visibilité qu'un
+# Deployment centralisé ne pourrait pas avoir (contrairement à Alloy,
+# Étape 2 du Projet 3, qui lit via l'API Kubernetes et n'avait PAS besoin
+# d'un DaemonSet). Sur 4 nodes, chaque unité de ressource demandée est
+# multipliée par 4 — la même leçon déjà vécue avec Prometheus/Alloy
+# (Projet 3, Étapes 1-2), appliquée ici dès le départ plutôt que
+# découverte après un `Pending`.
+#
+# ❓ Pourquoi `modern_ebpf` + `leastPrivileged: true`
+# Le chart propose 3 modes : module noyau (`kmod`, nécessite des headers
+# noyau absents des images Container-Optimized OS de GKE), eBPF
+# "classique" (nécessite `privileged: true`, un conteneur avec TOUS les
+# droits), et eBPF "moderne" avec `leastPrivileged: true` (seulement 4
+# capabilities Linux précises : BPF, SYS_RESOURCE, PERFMON, SYS_PTRACE).
+# Un comble aurait été de déployer l'outil de SÉCURITÉ runtime en mode le
+# moins sécurisé disponible — le mode le plus récent est aussi le plus
+# restreint, cohérent avec l'esprit du projet.
+driver:
+  kind: modern_ebpf
+  modernEbpf:
+    leastPrivileged: true
+
+resources:
+  # ⚠️ Piège rencontré pour de vrai : même à 50m, 3 des 5 pods Falco
+  # restaient `Pending` — les nodes de ce cluster (déjà GitOps +
+  # Observability + Kyverno) tournent tous à 90-98% de leur CPU allouable.
+  # Vérifié avant de baisser encore : les DaemonSets SYSTÈME de GKE
+  # (anetd/Cilium, fluentbit, gke-metadata-server) consomment déjà, À EUX
+  # SEULS, plus de la moitié du CPU demandé sur tout le cluster — un
+  # "impôt" fixe par node, hors de contrôle de ce projet, qui rend
+  # d'autant plus coûteux chaque DaemonSet supplémentaire. Réduit à 25m :
+  # la LIMITE (200m) reste inchangée, un pic réel de charge peut toujours
+  # emprunter au-delà de la requête.
+  requests:
+    cpu: 25m
+    memory: 128Mi
+  limits:
+    cpu: 200m
+    memory: 256Mi
+
+# Pas de falcosidekick (routage vers Slack/autre) — même choix assumé que
+# Alertmanager (Étape 7, Projet 3) et l'alerte FinOps (Projet 2) : les
+# détections restent visibles dans les logs du pod, aucun canal de
+# notification actif pour un lab à un seul opérateur.
+falcosidekick:
+  enabled: false
+
+# ⚠️ Piège rencontré pour de vrai en poussant la règle personnalisée
+# ci-dessous : `maxUnavailable` par défaut du DaemonSet (1, implicite)
+# a fait stagner le rollout ENTIER — le pod jamais schedulé sur le node
+# saturé (voir README, couverture partielle acceptée) comptait comme
+# "en cours de mise à jour" et bloquait la mise à jour des 4 AUTRES
+# nodes, pourtant parfaitement sains. Un unique node sans marge de
+# capacité suffit à geler tout futur déploiement de Falco sans ce
+# réglage — corrigé en autorisant plusieurs nodes à être indisponibles
+# en même temps pendant un rollout.
+controller:
+  daemonset:
+    updateStrategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxUnavailable: 100%
+
+# ❓ Pourquoi une règle personnalisée plutôt que la règle par défaut
+# Falco a DÉJÀ une règle "Terminal shell in container" — vérifié en
+# testant AVANT d'écrire quoi que ce soit ici (même discipline que
+# TaskTrackerPodCrashLooping, Étape 7 du Projet 3 : ne pas dupliquer ce
+# qui existe déjà). Elle a détecté, pour de vrai, un `kubectl exec` réel
+# dans le pod backend, priorité NOTICE générique, non scopée. La règle
+# ci-dessous élève la priorité à CRITICAL et scope spécifiquement au
+# namespace task-tracker (notre app "production", où un shell interactif
+# est un signal bien plus fort que dans un namespace d'outillage/debug).
+#
+# ⚠️ Piège rencontré pour de vrai, et sa fausse piste avant la vraie
+# cause : la règle ne se déclenchait JAMAIS au départ — pas même une
+# copie EXACTE de la condition de la règle par défaut (qui, elle,
+# fonctionne). Premier réflexe (faux) : soupçonner le FILTRAGE par les
+# champs `k8s.ns.name`/`container.name`/`container.image.repository` —
+# plusieurs variantes testées, aucune n'a changé le résultat, ce qui
+# aurait dû immédiatement écarter cette piste. Vraie cause, trouvée en
+# relisant la config Falco elle-même : `rule_matching: first` (réglage
+# par défaut du moteur) — Falco arrête d'évaluer les règles pour un
+# événement dès qu'UNE règle a matché. La règle par défaut, chargée
+# AVANT tout fichier de `/etc/falco/rules.d/` (donc avant la mienne),
+# "consommait" systématiquement chaque événement de shell avant que ma
+# propre règle n'ait la moindre chance d'être évaluée sur ce même
+# événement — aucun rapport avec les noms de champs. Fixé en passant
+# `rule_matching: all` : Falco évalue désormais TOUTES les règles qui
+# matchent un événement, pas seulement la première.
+falco:
+  rule_matching: all
+
+customRules:
+  rules-task-tracker.yaml: |-
+    - rule: Shell dans un conteneur task-tracker
+      desc: >
+        Un shell interactif a été ouvert dans un conteneur du namespace
+        task-tracker — rarement légitime hors débogage ponctuel. Élève
+        la priorité de NOTICE (règle par défaut, tout namespace
+        confondu) à CRITICAL, spécifiquement pour notre app "production".
+      condition: >
+        spawned_process
+        and container
+        and shell_procs
+        and proc.tty != 0
+        and container_entrypoint
+        and k8s.ns.name = "task-tracker"
+      output: >
+        ALERTE task-tracker : shell interactif ouvert (user=%user.name
+        process=%proc.name pod=%k8s.pod.name container=%container.name
+        commande=%proc.cmdline)
+      priority: CRITICAL
+      tags: [task-tracker, shell, mitre_execution]

@@ -64,7 +64,7 @@ Mêmes symboles que les Projets 1-3 en tête de bloc de commentaire :
 | 3 — SBOM (Syft) | ✅ **SBOM réel généré (337 Ko), vérifié** (dépôt gitops-platform) |
 | 4 — Image Signing (Cosign) | ✅ **signature vérifiée + contrôle négatif** (dépôt gitops-platform) |
 | 5 — Admission Control (Kyverno) | ✅ **déployé, `Enforce`, testé sur le vrai cluster** — voir §Admission Control |
-| 6 — Runtime Security (Falco) | ⬜ à faire |
+| 6 — Runtime Security (Falco) | ✅ **déployé, testé sur le vrai cluster** — voir §Runtime Security |
 | 7 — Network Security | ⬜ à faire |
 | 8 — Security Testing | ⬜ à faire |
 
@@ -168,8 +168,58 @@ helm install kyverno kyverno/kyverno -n kyverno --create-namespace \
 kubectl apply -f k8s/kyverno/policies.yaml
 ```
 
+## Runtime Security (Falco)
+
+`k8s/falco/` — Falco en DaemonSet (mode `modern_ebpf` +
+`leastPrivileged: true` : capabilities Linux précises plutôt que
+`privileged: true`, cohérent avec l'esprit du projet), règle par défaut
+"Terminal shell in container" déjà présente, complétée par une règle
+personnalisée scopée à `task-tracker`.
+
+⚠️ **Couverture partielle assumée** : sur 5 nodes, 1 reste sans Falco —
+le cluster est réellement à court de CPU (98% utilisé cluster-wide, plus
+de la moitié consommée par les DaemonSets SYSTÈME de GKE eux-mêmes :
+anetd/Cilium, fluentbit, gke-metadata-server). Décision prise
+consciemment plutôt que d'augmenter `machine_type` (un vrai coût GCP
+récurrent) : Falco tourne là où il y a de la place, le node saturé reste
+sans détection runtime — documenté ici, pas caché.
+
+**3 vrais bugs trouvés en testant, pas supposés :**
+
+1. **`maxUnavailable` implicite (1) a fait stagner tout le rollout** :
+   le pod jamais schedulable sur le node saturé comptait comme "en
+   cours de mise à jour" et bloquait la mise à jour des 4 autres nodes,
+   pourtant sains. Fixé avec `maxUnavailable: 100%`.
+2. **La règle personnalisée ne se déclenchait JAMAIS**, quelle que soit
+   sa condition — y compris une copie EXACTE de la condition de la
+   règle par défaut, qui elle fonctionne. Fausse piste explorée en
+   premier (et écartée à tort trop tard) : soupçonner le filtrage par
+   `k8s.ns.name`/`container.name`/`container.image.repository`.
+   **Vraie cause** : `rule_matching: first` (réglage par défaut du
+   moteur Falco) — il arrête d'évaluer les règles pour un événement dès
+   qu'UNE règle a matché, et la règle par défaut (chargée avant tout
+   fichier personnalisé) consommait systématiquement chaque événement
+   de shell en premier. Rien à voir avec les noms de champs. Fixé avec
+   `falco.rule_matching: all`.
+3. Consequence du bug précédent : plusieurs itérations de diagnostic
+   ont été nécessaires avant de trouver la vraie cause — documenté tel
+   quel (fausse piste comprise) plutôt que réécrit comme si la bonne
+   réponse avait été trouvée du premier coup.
+
+**Vérifié réellement** : un `kubectl exec` réel dans le pod backend
+déclenche SIMULTANÉMENT la règle par défaut (`Notice`, générique) ET la
+règle personnalisée (`Critical`, scopée `task-tracker`, avec le nom du
+pod/conteneur/commande exacts) — même timestamp, deux règles
+indépendantes sur le même événement, preuve que `rule_matching: all`
+fonctionne pour de vrai.
+
+```bash
+helm install falco falcosecurity/falco -n falco --create-namespace \
+  -f k8s/falco/values.yaml --version 9.1.0 --wait
+```
+
 ---
 
-*Les sections Étapes 6-8 seront ajoutées au fil de l'avancement réel,
+*Les sections Étapes 7-8 seront ajoutées au fil de l'avancement réel,
 testées sur le cluster avant d'être documentées — même discipline que les
 Projets 1 à 3.*
